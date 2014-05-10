@@ -34,12 +34,18 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "bcm_host.h"
 #include "ilclient.h"
-#include "triangle.h"
+
+#ifndef VIDEO_H
+   #include "video.h"
+#endif
+
+
+static int video_decode(VIDEO_THREAD_DATA_T *video);
 
 static OMX_BUFFERHEADERTYPE* eglBuffer = NULL;
 static COMPONENT_T* egl_render = NULL;
 
-static void* eglImage = 0;
+static VIDEO_THREAD_DATA_T *video;
 
 void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 {
@@ -52,24 +58,21 @@ void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 
 
 // Modified function prototype to work with pthreads
-void *video_decode_test(void *arg)
+void *video_decode_main(void *arg)
 {
    printf("pV: video_decode_test start\n");
+   video->state = VIDEO_STATE_STOPPED;
 
-   // VIDEO_THREAD_DATA_T *thData = arg;
+   video = arg;
 
-   eglImage = arg->eglImage;
-   char* filename = arg->filename;
+   printf("pV: %s\n", video->filename);
 
-   printf("pV: filename: %s\n", filename);
-   printf("pV: eglImage: %d\n", eglImage);
-
-   if (eglImage == 0)
-   {
-      printf("eglImage is null.\n");
-      exit(1);
-   }
+   int code = video_decode(video);
+   video->state = VIDEO_STATE_TERMINATED;
+   return (void*) code;
+}
    
+static int video_decode(VIDEO_THREAD_DATA_T *video) {
    OMX_VIDEO_PARAM_PORTFORMATTYPE format;
    OMX_TIME_CONFIG_CLOCKSTATETYPE cstate;
    COMPONENT_T *video_decode = NULL, *video_scheduler = NULL, *clock = NULL;
@@ -83,20 +86,20 @@ void *video_decode_test(void *arg)
    memset(list, 0, sizeof(list));
    memset(tunnel, 0, sizeof(tunnel));
 
-   if((in = fopen(filename, "rb")) == NULL)
-      return (void *)-2;
+   if((in = fopen(video->filename, "rb")) == NULL)
+      return -2;
 
    if((client = ilclient_init()) == NULL)
    {
       fclose(in);
-      return (void *)-3;
+      return -3;
    }
 
    if(OMX_Init() != OMX_ErrorNone)
    {
       ilclient_destroy(client);
       fclose(in);
-      return (void *)-4;
+      return -4;
    }
 
    // callback
@@ -161,12 +164,32 @@ void *video_decode_test(void *arg)
 
       while((buf = ilclient_get_input_buffer(video_decode, 130, 1)) != NULL)
       {
+         // Pause if necessary
+         if (video->command == VIDEO_COMMAND_PAUSE) {
+            video->state = VIDEO_STATE_PAUSED;
+            struct timespec timInterval, timRemainder;
+            timInterval.tv_sec = 0;
+            timInterval.tv_nsec = 50000000L;
+            while (video->command == VIDEO_COMMAND_PAUSE) {
+               nanosleep(&timInterval, &timRemainder);
+            }
+         }
+
+         // Devamp if necessary
+         if (feof(in)) {
+            if (video->command == VIDEO_COMMAND_DEVAMP)
+               video->command = VIDEO_COMMAND_STOP;
+            else
+               rewind(in);
+         }
+
+         if (video->command == VIDEO_COMMAND_STOP || video->command == VIDEO_COMMAND_TERMINATE) {
+            break;
+         }
+         video->state = VIDEO_STATE_PLAYING;
+
          // feed data and wait until we get port settings changed
          unsigned char *dest = buf->pBuffer;
-
-         // loop if at end
-         if (feof(in))
-            rewind(in);
 
          data_len += fread(dest, 1, buf->nAllocLen-data_len, in);
 
@@ -203,10 +226,10 @@ void *video_decode_test(void *arg)
                exit(1);
             }
 
-            if (OMX_UseEGLImage(ILC_GET_HANDLE(egl_render), &eglBuffer, 221, NULL, eglImage) != OMX_ErrorNone)
+            if (OMX_UseEGLImage(ILC_GET_HANDLE(egl_render), &eglBuffer, 221, NULL, video->eglImage) != OMX_ErrorNone)
             {
                printf("OMX_UseEGLImage failed.\n");
-               exit(1);
+               return -1;
             }
 
             // Set egl_render to executing
@@ -217,7 +240,7 @@ void *video_decode_test(void *arg)
             if(OMX_FillThisBuffer(ILC_GET_HANDLE(egl_render), eglBuffer) != OMX_ErrorNone)
             {
                printf("OMX_FillThisBuffer failed.\n");
-               exit(1);
+               return -4;
             }
          }
          if(!data_len)
@@ -269,5 +292,5 @@ void *video_decode_test(void *arg)
    OMX_Deinit();
 
    ilclient_destroy(client);
-   return (void *)status;
+   return status;
 }

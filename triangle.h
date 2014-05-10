@@ -26,11 +26,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #pragma once
 
-
-void* video_decode_test(void* arg);
-
 typedef struct
 {
-   char *filename;
-   void *eglImage;
-} VIDEO_THREAD_DATA_T;
+  float target;
+  float speed;
+  double startSeconds;
+  float startAlpha;
+} FADE_DATA_T;

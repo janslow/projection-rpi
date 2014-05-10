@@ -36,6 +36,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "bcm_host.h"
 
@@ -44,13 +45,17 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "EGL/eglext.h"
 
 #include "triangle.h"
-#include <pthread.h>
+#ifndef VIDEO_H
+   #include "video.h"
+#endif
 
 
 #define PATH "./"
 
 #define IMAGE_SIZE_WIDTH 1920
 #define IMAGE_SIZE_HEIGHT 1080
+
+// #define ENABLE_TEXTURES
 
 #ifndef M_PI
    #define M_PI 3.141592654
@@ -71,16 +76,20 @@ typedef struct
 } CUBE_STATE_T;
 
 static void init_ogl(CUBE_STATE_T *state);
-static void init_model_proj(CUBE_STATE_T *state);
 static void redraw_scene(CUBE_STATE_T *state);
 static void init_textures(CUBE_STATE_T *state, char *filename);
 static void exit_func(void);
+static void update_fade(CUBE_STATE_T *state, FADE_DATA_T *fade);
+static double seconds();
+static void stop_video_blocking(VIDEO_THREAD_DATA_T *video);
+
 static volatile int terminate;
 static CUBE_STATE_T _state, *state=&_state;
 
 static void* eglImage = 0;
-static pthread_t thread1;
-static VIDEO_THREAD_DATA_T thData;
+static pthread_t videoThread;
+static VIDEO_THREAD_DATA_T _video, *video=&_video;
+static FADE_DATA_T _fade, *fade=&_fade;
 
 static GLbyte quadx[4*3] = {
    -10, -10,  0,
@@ -202,21 +211,8 @@ static void init_ogl(CUBE_STATE_T *state)
    glDisable(GL_DEPTH_TEST);
 
    glMatrixMode(GL_MODELVIEW);
-}
 
-/***********************************************************
- * Name: init_model_proj
- *
- * Arguments:
- *       CUBE_STATE_T *state - holds OGLES model info
- *
- * Description: Sets the OpenGL|ES model to default values
- *
- * Returns: void
- *
- ***********************************************************/
-static void init_model_proj(CUBE_STATE_T *state)
-{
+   // Set-up model
 
    glViewport(0, 0, (GLsizei)state->screen_width, (GLsizei)state->screen_height);
       
@@ -254,6 +250,11 @@ static void redraw_scene(CUBE_STATE_T *state)
    // move camera back to see the cube
    glTranslatef(0.f, 0.f, -50.0f);
 
+   colorx[3] = state->alpha;
+   colorx[7] = state->alpha;
+   colorx[11] = state->alpha;
+   colorx[15] = state->alpha;
+
    // Start with a clear screen
    glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
@@ -278,6 +279,7 @@ static void redraw_scene(CUBE_STATE_T *state)
  ***********************************************************/
 static void init_textures(CUBE_STATE_T *state, char *filename)
 {
+   #ifdef ENABLE_TEXTURES
    // load three texture buffers but use them on six OGL|ES texture surfaces
    glGenTextures(1, &state->tex);
 
@@ -289,7 +291,6 @@ static void init_textures(CUBE_STATE_T *state, char *filename)
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
 
    /* Create EGL Image */
    eglImage = eglCreateImageKHR(
@@ -304,11 +305,15 @@ static void init_textures(CUBE_STATE_T *state, char *filename)
       printf("eglCreateImageKHR failed.\n");
       exit(1);
    }
+   #endif
 
-   thData.filename = filename;
-   thData.eglImage = eglImage;
-   pthread_create(&thread1, NULL, video_decode_test, &thData);
+   video->filename = filename;
+   video->eglImage = eglImage;
+   video->state = VIDEO_STATE_STOPPED;
+   video->command = VIDEO_COMMAND_PLAY;
+   pthread_create(&videoThread, NULL, video_decode_main, &video);
 
+   #ifdef ENABLE_TEXTURES
    // setup overall texture environment
    glTexCoordPointer(2, GL_FLOAT, 0, texCoords);
    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -317,13 +322,13 @@ static void init_textures(CUBE_STATE_T *state, char *filename)
 
    // Bind texture surface to current vertices
    glBindTexture(GL_TEXTURE_2D, state->tex);
+   #endif
 }
 //------------------------------------------------------------------------------
 
 static void exit_func(void)
 // Function to be passed to atexit().
 {
-   pthread_cancel(&thread1);
    
    printf("\nCLEAN UP\n");
    if (eglImage != 0)
@@ -350,8 +355,48 @@ static void exit_func(void)
    printf("\ncube closed\n");
 }
 
+static void stop_video_blocking(VIDEO_THREAD_DATA_T* video) {
+   video->command = VIDEO_COMMAND_TERMINATE;
+
+   struct timespec timInterval, timRemainder;
+   timInterval.tv_sec = 0;
+   timInterval.tv_nsec = 100000000L;
+   printf("Waiting for video thread to terminate\n");
+   while (video->state != VIDEO_STATE_TERMINATED)
+   {
+      nanosleep(&timInterval, &timRemainder);
+   }
+}
+
 //==============================================================================
 
+static double seconds() {
+   struct timespec t;
+   clock_gettime(CLOCK_REALTIME, &t);
+   return (double)t.tv_nsec / 1000000000 + (double)t.tv_sec;
+}
+
+static void update_fade(CUBE_STATE_T *state, FADE_DATA_T *fade) {
+   if (fade < 0 || fade->speed < 0)
+      return;
+   // dir > 1 iff alpha is increasing
+   int dir = 1;
+   if (fade->target < fade->startAlpha)
+      dir = -1;
+
+   double timeDiff = seconds() - fade->startSeconds;
+   // delta = magnitude of change since start
+   float delta = timeDiff * fade->speed;
+   // alpha = alpha' * delta * dir
+   float alpha = fade->startAlpha + (delta * dir);
+   if ((dir > 0 && alpha > fade->target) || (dir < 0 && alpha < fade->target)) {
+      printf("Finished fade to %f\n", fade->target);
+      state->alpha = fade->target;
+      fade->speed = -1;
+   } else {
+      state->alpha = alpha;
+   }
+}
 void sig_handler(int signo) {
    terminate = 1;
    signal(SIGINT, SIG_DFL);
@@ -375,28 +420,30 @@ int main (int argc, char **argv)
    init_ogl(state);
    printf("OpenGL ES initialized\n");
 
-   // Setup the model world
-   init_model_proj(state);
-   printf("Model Initialized\n");
-
    // initialise the OGLES texture(s)
    init_textures(state, argv[1]);
    printf("Textures Initialized\n");
+
+   fade->target = 0.0f;
+   fade->speed = 0.1f;
+   fade->startSeconds = seconds();
+   fade->startAlpha = state->alpha;
 
    signal(SIGINT, sig_handler);
 
    printf("\nStarting render loop\n");
    while (!terminate)
    {
-      struct timeval  tv;
-      gettimeofday(&tv, NULL);
-      long t = 
-         (long)(tv.tv_usec / 1000);
-         state->alpha = t / 1000.0f;
+      update_fade(state, fade);
 
       redraw_scene(state);
    }
    printf("Finished render loop\n");
+
+   stop_video_blocking(video);
+
+   printf("Video thread terminated\n");
    exit_func();
+   printf("Clean-up finished\n");
    return 0;
 }
