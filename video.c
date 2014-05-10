@@ -42,6 +42,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 static int video_decode(VIDEO_THREAD_DATA_T *video);
 
+static void pause_if_necessary(VIDEO_THREAD_DATA_T *video);
+static void devamp_if_necessary(VIDEO_THREAD_DATA_T *video, FILE *in);
+
 static OMX_BUFFERHEADERTYPE* eglBuffer = NULL;
 static COMPONENT_T* egl_render = NULL;
 
@@ -69,11 +72,11 @@ void *video_decode_main(void *arg)
 
 	int code = video_decode(video);
 	video->state = VIDEO_STATE_TERMINATED;
+	printf("pV: terminating with code %d\n", code);
 	return (void*) code;
 }
 
 static void pause_if_necessary(VIDEO_THREAD_DATA_T *video) {
-	// Pause if necessary
 	if (video->command == VIDEO_COMMAND_PAUSE) {
 		video->state = VIDEO_STATE_PAUSED;
 		struct timespec timInterval, timRemainder;
@@ -86,7 +89,6 @@ static void pause_if_necessary(VIDEO_THREAD_DATA_T *video) {
 }
 
 static void devamp_if_necessary(VIDEO_THREAD_DATA_T *video, FILE *in) {
-	// Devamp if necessary
 	if (feof(in)) {
 		if (video->command == VIDEO_COMMAND_DEVAMP)
 			video->command = VIDEO_COMMAND_STOP;
@@ -94,15 +96,27 @@ static void devamp_if_necessary(VIDEO_THREAD_DATA_T *video, FILE *in) {
 			rewind(in);
 	}
 }
+
+static void setupClockState(OMX_TIME_CONFIG_CLOCKSTATETYPE cstate) {
+	cstate.nSize = sizeof(cstate);
+	cstate.nVersion.nVersion = OMX_VERSION;
+	cstate.eState = OMX_TIME_ClockStateWaitingForStartTime;
+	cstate.nWaitMask = 1;
+}
+
+static void setupVideoFormat(OMX_VIDEO_PARAM_PORTFORMATTYPE format) {
+	format.nSize = sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE);
+	format.nVersion.nVersion = OMX_VERSION;
+	format.nPortIndex = 130;
+	format.eCompressionFormat = OMX_VIDEO_CodingAVC;
+}
 	
 static int video_decode(VIDEO_THREAD_DATA_T *video) {
-	OMX_VIDEO_PARAM_PORTFORMATTYPE format;
-	OMX_TIME_CONFIG_CLOCKSTATETYPE cstate;
-	COMPONENT_T *video_decode = NULL, *video_scheduler = NULL, *clock = NULL;
 	COMPONENT_T *list[5];
 	TUNNEL_T tunnel[4];
 	ILCLIENT_T *client;
 	FILE *in;
+
 	int status = 0;
 	unsigned int data_len = 0;
 
@@ -128,39 +142,41 @@ static int video_decode(VIDEO_THREAD_DATA_T *video) {
 	// callback
 	ilclient_set_fill_buffer_done_callback(client, my_fill_buffer_done, 0);
 
-	// create video_decode
+	// Video Decoder
+	COMPONENT_T *video_decode = NULL;
 	if(ilclient_create_component(client, &video_decode, "video_decode", ILCLIENT_DISABLE_ALL_PORTS | ILCLIENT_ENABLE_INPUT_BUFFERS) != 0)
 		status = -14;
 	list[0] = video_decode;
 
-	// create egl_render
+	// EGL Renderer
 	if(status == 0 && ilclient_create_component(client, &egl_render, "egl_render", ILCLIENT_DISABLE_ALL_PORTS | ILCLIENT_ENABLE_OUTPUT_BUFFERS) != 0)
 		status = -14;
 	list[1] = egl_render;
 
-	// create clock
+	// Clock
+	COMPONENT_T *clock = NULL;
 	if(status == 0 && ilclient_create_component(client, &clock, "clock", ILCLIENT_DISABLE_ALL_PORTS) != 0)
 		status = -14;
 	list[2] = clock;
-
+	OMX_TIME_CONFIG_CLOCKSTATETYPE cstate;
 	memset(&cstate, 0, sizeof(cstate));
-	cstate.nSize = sizeof(cstate);
-	cstate.nVersion.nVersion = OMX_VERSION;
-	cstate.eState = OMX_TIME_ClockStateWaitingForStartTime;
-	cstate.nWaitMask = 1;
+	setupClockState(cstate);
+
 	if(clock != NULL && OMX_SetParameter(ILC_GET_HANDLE(clock), OMX_IndexConfigTimeClockState, &cstate) != OMX_ErrorNone)
 		status = -13;
 
-	// create video_scheduler
+	// Video Scheduler
+	COMPONENT_T *video_scheduler = NULL;
 	if(status == 0 && ilclient_create_component(client, &video_scheduler, "video_scheduler", ILCLIENT_DISABLE_ALL_PORTS) != 0)
 		status = -14;
 	list[3] = video_scheduler;
 
+	// Setup tunnels
 	set_tunnel(tunnel, video_decode, 131, video_scheduler, 10);
 	set_tunnel(tunnel+1, video_scheduler, 11, egl_render, 220);
 	set_tunnel(tunnel+2, clock, 80, video_scheduler, 12);
 
-	// setup clock tunnel first
+	// Setup clock tunnel
 	if(status == 0 && ilclient_setup_tunnel(tunnel+2, 0, 0) != 0)
 		status = -15;
 	else
@@ -169,16 +185,16 @@ static int video_decode(VIDEO_THREAD_DATA_T *video) {
 	if(status == 0)
 		ilclient_change_component_state(video_decode, OMX_StateIdle);
 
+	OMX_VIDEO_PARAM_PORTFORMATTYPE format;
 	memset(&format, 0, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
-	format.nSize = sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE);
-	format.nVersion.nVersion = OMX_VERSION;
-	format.nPortIndex = 130;
-	format.eCompressionFormat = OMX_VIDEO_CodingAVC;
+	setupVideoFormat(format);
 
 	if(status == 0 &&
 		OMX_SetParameter(ILC_GET_HANDLE(video_decode), OMX_IndexParamVideoPortFormat, &format) == OMX_ErrorNone &&
-		ilclient_enable_port_buffers(video_decode, 130, NULL, NULL, NULL) == 0)
-	{
+		ilclient_enable_port_buffers(video_decode, 130, NULL, NULL, NULL) != 0)
+		status = -16;
+
+	if (status == 0) {
 		OMX_BUFFERHEADERTYPE *buf;
 		int port_settings_changed = 0;
 		int first_packet = 1;
